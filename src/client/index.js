@@ -35,6 +35,11 @@ const en = {
   'Your answer': 'Your answer',
   'This view tried to open a page and was stopped.': 'This view tried to open a page and was stopped.',
   '(skipped)': '(skipped)',
+  'Refresh status': 'Refresh status',
+  'Could not load this view. Refresh its status to try again.': 'Could not load this view. Refresh its status to try again.',
+  'Could not confirm this answer. Refresh the view status before trying again.': 'Could not confirm this answer. Refresh the view status before trying again.',
+  'Could not close this view. Refresh its status to try again.': 'Could not close this view. Refresh its status to try again.',
+  'An answer is awaiting confirmation. Refresh its status; do not submit a different answer.': 'An answer is awaiting confirmation. Refresh its status; do not submit a different answer.',
 }
 const zh = {
   'Cancel': '取消',
@@ -61,6 +66,11 @@ const zh = {
   'Your answer': '你的回答',
   'This view tried to open a page and was stopped.': '此视图试图打开页面，已被停止。',
   '(skipped)': '（已跳过）',
+  'Refresh status': '刷新状态',
+  'Could not load this view. Refresh its status to try again.': '无法读取视图，请刷新状态重试',
+  'Could not confirm this answer. Refresh the view status before trying again.': '暂无法确认回答是否已提交，请先刷新视图状态',
+  'Could not close this view. Refresh its status to try again.': '未能关闭视图，请刷新状态重试',
+  'An answer is awaiting confirmation. Refresh its status; do not submit a different answer.': '回答正在等待确认，请刷新状态，不要改答',
 }
 
 // Slot components get `t` from the locale seat; the shared widgets read it and

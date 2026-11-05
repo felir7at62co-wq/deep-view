@@ -103,7 +103,7 @@ test('refused call (invalid blueprint) renders nothing', async () => {
   await unmount()
 })
 
-test('submitting an options card posts a reply and removes the card', async () => {
+test('submitting an options card posts a reply and settles the card', async () => {
   const calls = recordCalls({ id: 'v1', callId: 'c5', view: CHOICES, askedAt: 1 })
   const turn = makeTurn([{ callId: 'c5', args: { view: CHOICES } }])
   const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
@@ -118,7 +118,153 @@ test('submitting an options card posts a reply and removes the card', async () =
   assert.equal(reply.viewId, 'v1')
   assert.equal(reply.action, 'pick')
   assert.deepEqual(reply.values.selected, ['A'])
+  assert.ok(box.querySelector('.dv-q-settled'), 'confirmed answer stays visible until the transcript arrives')
+  assert.equal(box.querySelector('button.dv-q-opt'), null, 'the submitted card cannot be answered again')
   await unmount()
+})
+
+test('a failed pending query shows a retry action and can recover without a new answer', async () => {
+  let attempts = 0
+  globalThis.fetch = async () => {
+    if (++attempts === 1) throw new Error('PRIVATE_TRANSPORT_DETAILS')
+    return Response.json({ ok: true, value: { id: 'v1', callId: 'recover', view: CHOICES } })
+  }
+  const turn = makeTurn([{ callId: 'recover', args: { view: CHOICES } }])
+  const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  assert.match(box.querySelector('[role=alert]')?.textContent ?? '', /Could not load/)
+  assert.doesNotMatch(box.textContent, /PRIVATE_TRANSPORT/)
+  await act(async () => { box.querySelector('button').click() })
+  assert.ok(box.querySelector('.dv-q-opt'), 'a successful status retry restores the live card')
+  assert.equal(box.querySelector('[role=alert]'), null)
+  assert.equal(attempts, 2)
+  await unmount()
+})
+
+test('pending refresh failure keeps selected inputs visible and disabled until status is confirmed', async () => {
+  const multi = { ...CHOICES, multi: true }
+  let attempts = 0
+  globalThis.fetch = async () => {
+    if (++attempts === 2) throw new Error('offline')
+    return Response.json({ ok: true, value: { id: 'v1', callId: 'retain', view: multi } })
+  }
+  const turn = makeTurn([{ callId: 'retain', args: { view: multi } }])
+  const { box, root, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await act(async () => { box.querySelector('.dv-q-opt').click() })
+  assert.equal(box.querySelector('.dv-q-opt').getAttribute('aria-pressed'), 'true')
+  await act(async () => { root.render(h(ViewUi.Provider, { value: ui }, h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(3)) }))) })
+  assert.ok(box.querySelector('[role=alert]'))
+  assert.equal(box.querySelector('.dv-q-opt').getAttribute('aria-pressed'), 'true', 'selection survives the failed query')
+  assert.equal(box.querySelector('.dv-q-submit').disabled, true)
+  await act(async () => { box.querySelector('[role=alert] button').click() })
+  assert.equal(box.querySelector('.dv-q-opt').getAttribute('aria-pressed'), 'true', 'retry does not remount the input')
+  assert.equal(box.querySelector('.dv-q-submit').disabled, false)
+  await unmount()
+})
+
+test('a rejected reply retains the card and requires status refresh before another answer', async () => {
+  const calls = []
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body)
+    calls.push(body)
+    if (body.op === 'reply') return Response.json({ ok: false, error: { code: 'deep-view/unconfirmed', message: 'PRIVATE_SERVER_ERROR' } })
+    return Response.json({ ok: true, value: { id: 'v1', callId: 'failed-reply', view: CHOICES } })
+  }
+  const turn = makeTurn([{ callId: 'failed-reply', args: { view: CHOICES } }])
+  const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await act(async () => { box.querySelector('.dv-q-opt').click() })
+  assert.match(box.querySelector('[role=alert]')?.textContent ?? '', /Could not confirm/)
+  assert.doesNotMatch(box.textContent, /PRIVATE_SERVER_ERROR/)
+  assert.ok(box.querySelector('.dv-q'), 'card stays visible')
+  assert.equal(box.querySelector('.dv-q-opt').disabled, true)
+  assert.equal(calls.filter(body => body.op === 'reply').length, 1)
+  await act(async () => { box.querySelector('[role=alert] button').click() })
+  assert.equal(box.querySelector('.dv-q-opt').disabled, false)
+  assert.equal(calls.filter(body => body.op === 'reply').length, 1, 'status refresh never resubmits')
+  await unmount()
+})
+
+test('a failed form submission keeps the edited text after a status refresh', async () => {
+  const form = { type: 'form', id: 'note', fields: [{ id: 'description', label: 'Description', value: 'Initial' }] }
+  globalThis.fetch = async (_url, options) => JSON.parse(options.body).op === 'pending'
+    ? Response.json({ ok: true, value: { id: 'v1', callId: 'form-failure', view: form } })
+    : Response.json({ ok: false, error: { code: 'deep-view/internal', message: 'offline' } })
+  const turn = makeTurn([{ callId: 'form-failure', args: { view: form } }])
+  const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  const input = box.querySelector('input.dv-q-input')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set.call(input, 'My retained draft')
+    input.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  assert.equal(input.value, 'My retained draft')
+  await act(async () => { box.querySelector('form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })) })
+  assert.equal(input.value, 'My retained draft')
+  assert.equal(input.readOnly, true)
+  await act(async () => { box.querySelector('[role=alert] button').click() })
+  assert.equal(input.value, 'My retained draft')
+  assert.equal(input.readOnly, false)
+  await unmount()
+})
+
+test('same-frame double clicks issue one reply and dismissal carries the exact view id', async () => {
+  const calls = []
+  let release
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body)
+    calls.push(body)
+    if (body.op === 'pending') return Response.json({ ok: true, value: { id: 'v1', callId: 'double', view: CHOICES } })
+    await new Promise(resolve => { release = resolve })
+    return Response.json({ ok: true, value: true })
+  }
+  const turn = makeTurn([{ callId: 'double', args: { view: CHOICES } }])
+  const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await act(async () => {
+    const button = box.querySelector('.dv-q-opt')
+    button.click()
+    button.click()
+  })
+  assert.equal(calls.filter(body => body.op === 'reply').length, 1)
+  await act(async () => { release() })
+  await unmount()
+  const dismissCalls = recordCalls({ id: 'original-view', callId: 'dismiss', view: CHOICES })
+  const second = await render(h(ViewsTail, { turn: makeTurn([{ callId: 'dismiss', args: { view: CHOICES } }]), sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await act(async () => { second.box.querySelector('.dv-q-x').click() })
+  assert.deepEqual(dismissCalls.find(body => body.op === 'dismiss'), { op: 'dismiss', sessionId: 's1', viewId: 'original-view' })
+  assert.equal(second.box.querySelector('.dv-q'), null)
+  await second.unmount()
+})
+
+test('a persisted unconfirmed answer locks controls and refresh never resubmits it', async () => {
+  const calls = recordCalls({ id: 'v1', callId: 'uncertain', view: CHOICES, answerPending: true })
+  const turn = makeTurn([{ callId: 'uncertain', args: { view: CHOICES } }])
+  const { box, unmount } = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  assert.equal(box.querySelector('.dv-q-opt').disabled, true)
+  assert.equal(box.querySelector('.dv-q-x').disabled, true)
+  assert.match(box.querySelector('[role=status]')?.textContent ?? '', /awaiting confirmation/)
+  await act(async () => { box.querySelector('[role=status] button').click() })
+  assert.equal(calls.filter(body => body.op === 'pending').length, 2)
+  assert.equal(calls.filter(body => body.op === 'reply').length, 0)
+  await unmount()
+})
+
+test('unmount cancels the pending query and an in-flight answer', async () => {
+  const signals = []
+  globalThis.fetch = (_url, options) => {
+    signals.push(options.signal)
+    return new Promise((_resolve, reject) => { options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }) })
+  }
+  const turn = makeTurn([{ callId: 'cancel', args: { view: CHOICES } }])
+  const first = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await first.unmount()
+  assert.equal(signals[0].aborted, true)
+  globalThis.fetch = async (_url, options) => {
+    if (JSON.parse(options.body).op === 'pending') return Response.json({ ok: true, value: { id: 'v1', callId: 'cancel', view: CHOICES } })
+    signals.push(options.signal)
+    return new Promise((_resolve, reject) => { options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }) })
+  }
+  const second = await render(h(ViewsTail, { turn, sessionId: 's1', useConversation: useConversationOf(convOf(2)) }))
+  await act(async () => { second.box.querySelector('.dv-q-opt').click() })
+  await second.unmount()
+  assert.equal(signals[1].aborted, true)
 })
 
 test('an answered view renders the settled card from the reply in the chat, no pending fetch', async () => {

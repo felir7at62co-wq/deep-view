@@ -4,7 +4,7 @@
 import { install } from './src/host/install.js'
 
 export const name = 'deep-view'
-export const inject = ['tools', 'connection', 'sessionController', 'sessions']
+export const inject = ['tools', 'connection', 'sessionController', 'sessions', 'agents']
 
 export function apply(ctx, config = {}) {
   install(ctx, config)

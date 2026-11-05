@@ -1,199 +1,167 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { apply } from '../index.js'
+import { apply, inject } from '../index.js'
 import { fakeContext } from './fake-ctx.js'
 
 const CHOICES = { type: 'options', id: 'pick', options: [{ label: 'A' }, { label: 'B' }] }
 const METER = { type: 'metric', label: 'Progress', value: '70%' }
-
-function start({ beforeApply } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'deep-view-'))
-  const ctx = fakeContext()
-  const sent = []
-  let flushError
-  Object.assign(ctx, {
-    sessionController: {
-      resolveAgent: async sessionId => ({ agent: { session: { id: sessionId }, followup(message) { sent.push({ sessionId, message }) } } }),
-    },
-    sessions: { flush: async () => { if (flushError !== undefined) throw flushError } },
-  })
-  const agent = { id: 'a1', root: true, session: { id: 's1' } }
+function start(t, { home = mkdtempSync(join(tmpdir(), 'deep-view-')), beforeApply } = {}) {
+  const ctx = fakeContext(), sent = [], events = []
+  t.after(async () => { await ctx.dispose(); await rm(home, { recursive: true, force: true }) })
+  let flushError, resolveHook, seq = 0, route
+  const agent = { id: 'a1', root: true,
+    session: { id: 's1', get seq() { return seq + 1 }, deriveMessages: () => events.filter(event => event.type === 'user/message').map(event => event.data) },
+    inbox: { nextTurn: [], nextStep: [] }, followup(message) { sent.push({ sessionId: 's1', message }); this.inbox.nextTurn.push(message) } }
   ctx.agentsRegistry.map.set('a1', agent)
-  let route
-  ctx.connection.fetch.register = (options) => { route = options; return async () => {} }
+  ctx.sessionController.resolveAgent = async () => { await resolveHook?.(); return { agent } }
+  ctx.sessions.flush = async () => { if (flushError !== undefined) throw flushError }
+  ctx.connection.fetch.register = options => { route = options; return async () => {} }
   beforeApply?.(ctx)
   apply(ctx, { home })
-  let seq = 0
   const emit = (id, type, data) => {
-    for (const listener of ctx.listeners.get('session/event') ?? []) listener({ id }, { type, seq: ++seq, data })
+    const event = { type, seq: ++seq, data: type === 'user/message' ? { id: `message-${seq}`, ...data } : data }; events.push(event)
+    for (const listener of ctx.listeners.get('session/event') ?? []) listener({ id }, event)
   }
-  const exec = (over = {}) => ({ agent, callId: 'call-1', concluded: false, concludeTurn() { this.concluded = true }, ...over })
-  const show = (args, execOver) => ctx.registeredTools.get('show_view').execute(args, exec(execOver))
-  const call = async (op, body) => (await route.fetch(new Request(`http://localhost/api/deep-view`, {
+  const exec = (over = {}) => ({ agent, callId: 'call-1', signal: new AbortController().signal,
+    concluded: false, concludeTurn() { this.concluded = true }, ...over })
+  const show = (args, over) => ctx.registeredTools.get('show_view').execute(args, exec(over))
+  const call = async (op, body) => (await route.fetch(new Request('http://localhost/api/deep-view', {
     method: 'POST', body: JSON.stringify({ op, ...body }),
   }))).json()
-  // A revoke from emit() saves without being awaited, and the save makes the folder
-  // again, so remove it until no write in flight brings it back.
-  const stop = async () => {
-    for (let round = 0; round < 50; round++) {
-      try { rmSync(home, { recursive: true, force: true }) } catch { /* a write landed mid-removal */ }
-      await new Promise(resolve => setTimeout(resolve, 20))
-      if (!existsSync(home)) return
-    }
-    throw new Error(`could not remove ${home}`)
-  }
-  return { ctx, emit, show, call, sent, failFlush(e) { flushError = e }, stop }
+  const reply = (record, selected = ['A']) => call('reply', { sessionId: 's1', viewId: record.id, action: 'pick', values: { selected } })
+  return { ctx, home, agent, events, emit, show, exec, call, reply, sent,
+    failFlush(error) { flushError = error }, gateResolve(hook) { resolveHook = hook } }
 }
 
-test('a global show_view from another plugin warns instead of failing activation', async () => {
-  const { ctx, call, stop } = start({ beforeApply: fake => fake.tools.register({ name: 'show_view' }) })
-  try {
-    assert.equal(ctx.registeredTools.has('show_view'), true, 'the foreign tool stays registered')
-    assert.ok(ctx.warnings.some(line => line.includes('already provides show_view')), 'warned about the collision')
-    const result = await call('pending', { sessionId: 's1' })
-    assert.equal(result.ok, true, 'the rest of the plugin still works')
-  } finally { await stop() }
+test('declares the root registry and rejects duplicate global tool registration', t => {
+  assert.ok(inject.includes('agents'))
+  assert.throws(() => start(t, { beforeApply: ctx => ctx.tools.register({ name: 'show_view' }) }), /already registered/)
+})
+test('marks only its own result and displays read-only views without ending the turn', async t => {
+  const fixture = start(t), tool = fixture.ctx.registeredTools.get('show_view'), exec = fixture.exec()
+  assert.deepEqual(tool.output.presentationMeta({}, ''), { owner: 'deep-view' })
+  assert.equal(await tool.execute({ title: 'Progress', view: METER }, exec), 'The view is on screen.')
+  assert.equal(exec.concluded, false)
+  assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
+})
+test('refuses invalid blueprints and mismatched wait rules', async t => {
+  const fixture = start(t)
+  assert.match(await fixture.show({ view: { type: 'nope' } }), /unknown component/)
+  assert.match(await fixture.show({ view: METER, await_reply: true }), /nothing to submit/)
+  assert.match(await fixture.show({ view: CHOICES, await_reply: false }), /waits for the user/)
+})
+test('uses the durable call identity and requires a live root for an interactive view', async t => {
+  const fixture = start(t), tool = fixture.ctx.registeredTools.get('show_view'), exec = fixture.exec()
+  assert.match(await tool.execute({ view: CHOICES }, exec), /next message/)
+  assert.equal(exec.concluded, true)
+  assert.equal((await fixture.call('pending', { sessionId: 's1' })).value.id, 'call-1')
+  const child = { ...fixture.agent, id: 'child', root: false }
+  fixture.ctx.agentsRegistry.map.set(child.id, child)
+  assert.match(await fixture.show({ view: CHOICES }, { agent: child }), /root session/)
+  assert.match(await fixture.show({ view: CHOICES }, { agent: undefined }), /root session/)
+  assert.match(await fixture.show({ view: CHOICES }, { callId: undefined }), /tool-call identity/)
+})
+test('a failed save keeps the turn running and reports no private path', async t => {
+  const parent = mkdtempSync(join(tmpdir(), 'deep-view-block-')); t.after(() => rm(parent, { recursive: true, force: true }))
+  const blocker = join(parent, 'blocker'); await writeFile(blocker, 'x')
+  const fixture = start(t, { home: join(blocker, 'sub') }), exec = fixture.exec()
+  const text = await fixture.ctx.registeredTools.get('show_view').execute({ view: CHOICES }, exec)
+  assert.match(text, /could not be kept open/); assert.doesNotMatch(text, /deep-view-block-/)
+  assert.equal(exec.concluded, false)
+  assert.equal((await fixture.call('pending', { sessionId: 's1' })).error.code, 'deep-view/internal')
+})
+test('an uncertain flush retains one answer identity and retries never enqueue twice', async t => {
+  const fixture = start(t); await fixture.show({ view: CHOICES })
+  const record = (await fixture.call('pending', { sessionId: 's1' })).value
+  assert.equal((await fixture.reply(record, ['Nope'])).error.code, 'deep-view/invalid')
+  assert.equal((await fixture.reply({ ...record, id: 'old' })).error.code, 'deep-view/stale')
+  fixture.failFlush(new Error('private-disk-path'))
+  const failed = await fixture.reply(record)
+  assert.equal(failed.error.code, 'deep-view/unconfirmed'); assert.doesNotMatch(JSON.stringify(failed), /private-disk-path/)
+  const visible = (await fixture.call('pending', { sessionId: 's1' })).value
+  assert.equal(visible.answerPending, true); assert.equal(visible.delivery, undefined)
+  const intent = JSON.parse(await readFile(join(fixture.home, 'pending.json'), 'utf8')).s1.delivery
+  assert.equal(intent.message.id, fixture.sent[0].message.id)
+  assert.equal((await fixture.reply(record, ['B'])).error.code, 'deep-view/answer-conflict')
+  fixture.failFlush(undefined)
+  assert.deepEqual(await fixture.reply(record), { ok: true, value: true })
+  assert.deepEqual(await fixture.reply(record), { ok: true, value: true })
+  assert.equal(fixture.sent.length, 1); assert.equal(fixture.sent[0].message.source.kind, 'deep-view-reply')
+  assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
+})
+test('concurrent answers serialize across a blocked Agent lookup', async t => {
+  const fixture = start(t), entered = Promise.withResolvers(), release = Promise.withResolvers()
+  await fixture.show({ view: CHOICES }); const record = (await fixture.call('pending', { sessionId: 's1' })).value
+  fixture.gateResolve(async () => { entered.resolve(); await release.promise })
+  const first = fixture.reply(record); await entered.promise
+  const duplicate = fixture.reply(record); release.resolve()
+  assert.deepEqual(await Promise.all([first, duplicate]), [{ ok: true, value: true }, { ok: true, value: true }])
+  assert.equal(fixture.sent.length, 1)
+})
+test('a late close cannot dismiss a replacement view', async t => {
+  const fixture = start(t); await fixture.show({ view: CHOICES })
+  const old = (await fixture.call('pending', { sessionId: 's1' })).value
+  await fixture.show({ title: 'Replacement', view: CHOICES }, { callId: 'call-2' })
+  assert.equal((await fixture.call('dismiss', { sessionId: 's1', viewId: old.id })).error.code, 'deep-view/stale')
+  assert.equal((await fixture.call('pending', { sessionId: 's1' })).value.id, 'call-2')
+  assert.deepEqual(await fixture.call('dismiss', { sessionId: 's1', viewId: 'call-2' }), { ok: true, value: true })
+  assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
+})
+test('ordinary user messages revoke open cards while background notices leave them open', async t => {
+  const fixture = start(t)
+  for (const kind of ['user', 'user-question-reply', 'deep-view-reply']) {
+    await fixture.show({ view: CHOICES }); fixture.emit('s1', 'user/message', { source: { kind: 'schedule' } })
+    assert.notEqual((await fixture.call('pending', { sessionId: 's1' })).value, null)
+    fixture.emit('s1', 'user/message', { source: { kind } })
+    assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
+  }
+})
+test('a stopped plugin drains an in-flight lookup without admitting its answer', async t => {
+  const fixture = start(t), entered = Promise.withResolvers(), release = Promise.withResolvers()
+  await fixture.show({ view: CHOICES }); const record = (await fixture.call('pending', { sessionId: 's1' })).value
+  fixture.gateResolve(async () => { entered.resolve(); await release.promise })
+  const answering = fixture.reply(record); await entered.promise
+  const disposal = fixture.ctx.dispose(); release.resolve()
+  assert.equal((await answering).error.code, 'deep-view/unavailable'); await disposal
+  assert.equal(fixture.sent.length, 0)
+  assert.equal(JSON.parse(await readFile(join(fixture.home, 'pending.json'), 'utf8')).s1.delivery, undefined)
+  assert.equal(fixture.ctx.registeredTools.size, 0)
+})
+test('an aborted view request leaves no open card or concluded turn', async t => {
+  const fixture = start(t), controller = new AbortController(), exec = fixture.exec({ signal: controller.signal })
+  controller.abort()
+  await assert.rejects(fixture.ctx.registeredTools.get('show_view').execute({ view: CHOICES }, exec), error => error.name === 'AbortError')
+  assert.equal(exec.concluded, false)
+  assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
 })
 
-test('the tool output marks its results so the client draws only its own calls', async () => {
-  const { ctx, stop } = start()
-  try {
-    const tool = ctx.registeredTools.get('show_view')
-    assert.deepEqual(tool.output.presentationMeta({ view: {} }, 'The view is on screen.'), { owner: 'deep-view' })
-  } finally { await stop() }
+test('a restarted uncertain answer stays locked until its original message can be verified', async t => {
+  const fixture = start(t); await fixture.show({ view: CHOICES })
+  const record = (await fixture.call('pending', { sessionId: 's1' })).value
+  fixture.failFlush(new Error('unavailable'))
+  assert.equal((await fixture.reply(record)).error.code, 'deep-view/unconfirmed')
+  const original = fixture.sent[0].message
+  await fixture.ctx.dispose()
+  const restarted = start(t, { home: fixture.home })
+  assert.equal((await restarted.call('pending', { sessionId: 's1' })).value.answerPending, true)
+  assert.equal((await restarted.reply(record)).error.code, 'deep-view/unconfirmed')
+  assert.equal(restarted.sent.length, 0)
+  restarted.events.push({ type: 'user/message', seq: 1, data: original })
+  assert.deepEqual(await restarted.reply(record), { ok: true, value: true })
+  assert.equal(restarted.sent.length, 0)
 })
 
-test('display-only view: valid returns on-screen text, no pending record', async () => {
-  const t = start()
-  const text = await t.show({ title: 'Hi', view: METER })
-  assert.equal(text, 'The view is on screen.')
-  assert.deepEqual(await t.call('pending', { sessionId: 's1' }), { ok: true, value: null })
-  await t.stop()
-})
-
-test('validation: bad blueprint refuses with a path error', async () => {
-  const t = start()
-  const text = await t.show({ view: { type: 'nope' } })
-  assert.match(text, /view\.type: unknown component/)
-  await t.stop()
-})
-
-test('await rules: display-only cannot wait, interactive must', async () => {
-  const t = start()
-  assert.match(await t.show({ view: METER, await_reply: true }), /nothing to submit/)
-  assert.match(await t.show({ view: CHOICES, await_reply: false }), /waits for the user/)
-  await t.stop()
-})
-
-test('interactive view: root agent gets a pending record and the turn concludes', async () => {
-  const t = start()
-  const text = await t.show({ view: CHOICES })
-  assert.equal(text, 'The view is on screen; the user\'s answer arrives as their next message.')
-  const pending = (await t.call('pending', { sessionId: 's1' })).value
-  assert.equal(pending.callId, 'call-1')
-  assert.equal(pending.view.type, 'options')
-  // A second call replaces the first.
-  await t.show({ title: 'New', view: CHOICES }, { callId: 'call-2' })
-  assert.equal((await t.call('pending', { sessionId: 's1' })).value.callId, 'call-2')
-  assert.equal((await t.call('pending', { sessionId: 's1' })).value.title, 'New')
-  await t.stop()
-})
-
-test('interactive view: a delegated agent is refused', async () => {
-  const t = start()
-  const child = { id: 'sub', root: false, session: { id: 's2' } }
-  t.ctx.agentsRegistry.map.set('sub', child)
-  const text = await t.show({ view: CHOICES }, { agent: child, callId: 'c9' })
-  assert.match(text, /root session|final result/)
-  assert.deepEqual(await t.call('pending', { sessionId: 's2' }), { ok: true, value: null })
-  await t.stop()
-})
-
-test('interactive view: no agents registry cannot prove a delegated caller, so the view opens', async () => {
-  const t = start()
-  t.ctx.get = () => undefined
-  const text = await t.show({ view: CHOICES }, { callId: 'c10' })
-  assert.equal(text, 'The view is on screen; the user\'s answer arrives as their next message.')
-  assert.equal((await t.call('pending', { sessionId: 's1' })).value.callId, 'c10')
-  await t.stop()
-})
-
-test('interactive view: a failed write returns an error and the turn keeps running', async () => {
-  const file = mkdtempSync(join(tmpdir(), 'deep-view-file-'))
-  const blocker = join(file, 'blocker')
-  await import('node:fs/promises').then(fs => fs.writeFile(blocker, 'x'))
-  const t = start()
-  const stopHome = t.stop
-  t.stop = async () => { rmSync(file, { recursive: true, force: true, maxRetries: 5 }); await stopHome() }
-  // A home inside a regular file cannot be created, so every write fails.
-  const home = join(blocker, 'sub')
-  const ctx = fakeContext()
-  Object.assign(ctx, { sessionController: { resolveAgent: async sessionId => ({ agent: { session: { id: sessionId } } }) }, sessions: { flush: async () => {} } })
-  const agent = { id: 'a1', root: true, session: { id: 's1' } }
-  ctx.agentsRegistry.map.set('a1', agent)
-  apply(ctx, { home })
-  const text = await ctx.registeredTools.get('show_view').execute({ view: CHOICES }, { agent, callId: 'c11', concluded: false, concludeTurn() { this.concluded = true } })
-  assert.match(text, /could not be kept open/)
-  await t.stop()
-})
-
-test('reply: validation, stale, duplicate, restore-on-failure, success shape', async () => {
-  const t = start()
-  await t.show({ view: CHOICES })
-  const record = (await t.call('pending', { sessionId: 's1' })).value
-  // Bad answer refused without claiming.
-  const bad = await t.call('reply', { sessionId: 's1', viewId: record.id, action: 'pick', values: { selected: ['Nope'] } })
-  assert.equal(bad.ok, false)
-  assert.match(bad.error.message, /select at least one/)
-  // Stale id refused.
-  const stale = await t.call('reply', { sessionId: 's1', viewId: 'other', action: 'pick', values: { selected: ['A'] } })
-  assert.equal(stale.error.code, 'deep-view/stale')
-  // Flush failure restores the record.
-  t.failFlush(new Error('offline'))
-  const failed = await t.call('reply', { sessionId: 's1', viewId: record.id, action: 'pick', values: { selected: ['A'] } })
-  assert.equal(failed.ok, false)
-  assert.ok((await t.call('pending', { sessionId: 's1' })).value !== null)
-  t.failFlush(undefined)
-  // Success: claimed, answered message queued.
-  const done = await t.call('reply', { sessionId: 's1', viewId: record.id, action: 'pick', values: { selected: ['A'] } })
-  assert.deepEqual(done, { ok: true, value: true })
-  // The failed flush left its follow-up queued, so the success is the second.
-  assert.equal(t.sent.length, 2)
-  const message = t.sent.at(-1).message
-  assert.equal(message.source.kind, 'deep-view-reply')
-  assert.equal(message.source.outcome, 'answered')
-  const payload = JSON.parse(message.content[0].text)
-  assert.equal(payload.kind, 'answer_to_pending_view')
-  assert.deepEqual(payload.answers[0].values.selected, ['A'])
-  // Duplicate refused: the record is claimed.
-  const dup = await t.call('reply', { sessionId: 's1', viewId: record.id, action: 'pick', values: { selected: ['B'] } })
-  assert.equal(dup.error.code, 'deep-view/stale')
-  await t.stop()
-})
-
-test('revoke: a user message or card answer drops the pending view', async () => {
-  const t = start()
-  await t.show({ view: CHOICES })
-  t.emit('s1', 'user/message', { source: { kind: 'schedule' } })
-  assert.ok((await t.call('pending', { sessionId: 's1' })).value !== null)
-  t.emit('s1', 'user/message', { source: { kind: 'user' } })
-  assert.deepEqual(await t.call('pending', { sessionId: 's1' }), { ok: true, value: null })
-  await t.show({ view: CHOICES })
-  t.emit('s1', 'user/message', { source: { kind: 'user-question-reply' } })
-  assert.deepEqual(await t.call('pending', { sessionId: 's1' }), { ok: true, value: null })
-  await t.show({ view: CHOICES })
-  t.emit('s1', 'user/message', { source: { kind: 'deep-view-reply' } })
-  assert.deepEqual(await t.call('pending', { sessionId: 's1' }), { ok: true, value: null })
-  await t.stop()
-})
-
-test('dismiss drops the pending view', async () => {
-  const t = start()
-  await t.show({ view: CHOICES })
-  assert.deepEqual(await t.call('dismiss', { sessionId: 's1' }), { ok: true, value: true })
-  assert.deepEqual(await t.call('pending', { sessionId: 's1' }), { ok: true, value: null })
-  await t.stop()
+test('a newer human message invalidates an answer waiting for Agent lookup', async t => {
+  const fixture = start(t), entered = Promise.withResolvers(), release = Promise.withResolvers()
+  await fixture.show({ view: CHOICES }); const record = (await fixture.call('pending', { sessionId: 's1' })).value
+  fixture.gateResolve(async () => { entered.resolve(); await release.promise })
+  const answering = fixture.reply(record); await entered.promise
+  fixture.emit('s1', 'user/message', { source: { kind: 'user' } }); release.resolve()
+  assert.equal((await answering).error.code, 'deep-view/stale')
+  assert.equal(fixture.sent.length, 0)
+  assert.deepEqual(await fixture.call('pending', { sessionId: 's1' }), { ok: true, value: null })
 })

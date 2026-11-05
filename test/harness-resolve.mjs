@@ -36,6 +36,9 @@ process.env.DSH_HARNESS = harness
 // A checkout links the packages into its base bundle; an npm install has them at its root.
 const base = resolve(harness, 'packages/bundle/base/package.json')
 const anchor = pathToFileURL(existsSync(base) ? base : resolve(harness, 'package.json')).href
+const browserManifest = resolve(harness, 'apps/web/package.json')
+const browserAnchor = existsSync(browserManifest) ? pathToFileURL(browserManifest).href : anchor
+const rootAnchor = pathToFileURL(resolve(harness, 'package.json')).href
 const pluginUrl = `${pathToFileURL(plugin).href}/`
 
 // React and jsdom come from the same install: the client modules and the tests
@@ -46,7 +49,8 @@ const harnessOnly = specifier => specifier === 'react' || specifier.startsWith('
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.startsWith(pluginUrl) && (specifier.startsWith('@deepseek-ai/') || harnessOnly(specifier))) {
-      return nextResolve(specifier, { ...context, parentURL: anchor })
+      const parentURL = specifier === 'jsdom' ? rootAnchor : harnessOnly(specifier) ? browserAnchor : anchor
+      return nextResolve(specifier, { ...context, parentURL })
     }
     return nextResolve(specifier, context)
   },
