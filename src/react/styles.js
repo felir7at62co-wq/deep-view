@@ -80,7 +80,7 @@ button.dv-q-opt:active{background:var(--dv-active)}
 .dv-menu.dv-view-menu{position:absolute;z-index:4}
 .dv-menu button{display:flex;align-items:center;gap:4px;width:100%;min-height:30px;text-align:left;border:0;background:none;border-radius:6px;padding:6px 8px;font:inherit;font-size:13px;line-height:18px;color:var(--dv-ink);cursor:pointer;box-sizing:border-box}
 .dv-menu button:hover{background:var(--dv-hover)}
-.dv-menu 
+.dv-menu
 .dv-menu button{display:flex;align-items:center;gap:4px;width:100%;min-height:30px;text-align:left;border:0;background:none;border-radius:6px;padding:6px 8px;font:inherit;font-size:13px;line-height:18px;color:var(--dv-ink);cursor:pointer;box-sizing:border-box}
 .dv-menu button:hover{background:var(--dv-hover)}
 .dv-menu button svg{flex:none;width:16px;height:16px;margin:0 1px}
